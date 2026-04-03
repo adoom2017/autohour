@@ -15,8 +15,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "$ROOT_DIR/packaging/macos/Info.plist" "$CONTENTS_DIR/Info.plist"
-cp "$ROOT_DIR/packaging/macos/Autohour" "$MACOS_DIR/Autohour"
-cp "$ROOT_DIR/target/release/autohour" "$RESOURCES_DIR/autohour-bin"
+cp "$ROOT_DIR/target/release/autohour" "$MACOS_DIR/Autohour"
 cp -R "$ROOT_DIR/holidays" "$RESOURCES_DIR/holidays"
 cp "$ROOT_DIR/.env.example" "$RESOURCES_DIR/.env.example"
 
@@ -25,7 +24,6 @@ if [ -f "$ROOT_DIR/packaging/macos/AppIcon.icns" ]; then
 fi
 
 chmod +x "$MACOS_DIR/Autohour"
-chmod +x "$RESOURCES_DIR/autohour-bin"
 
 if [ -f "$ROOT_DIR/.env" ]; then
   cp "$ROOT_DIR/.env" "$RESOURCES_DIR/.env"

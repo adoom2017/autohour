@@ -20,6 +20,7 @@ use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use regex::Regex;
+use fs2::FileExt;
 use reqwest::Method;
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::cookie::CookieStore as _;
@@ -32,6 +33,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 #[cfg(target_os = "macos")]
 use tao::event::{Event, StartCause};
+#[cfg(target_os = "macos")]
+use mac_notification_sys::{MainButton, Notification, set_application};
 #[cfg(target_os = "macos")]
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 #[cfg(target_os = "macos")]
@@ -235,6 +238,15 @@ enum TaskOutcome {
         title: String,
         body: String,
         status: String,
+        notify_remote: bool,
+    },
+}
+
+#[cfg(target_os = "macos")]
+enum NotificationWork {
+    Send {
+        title: String,
+        body: String,
         notify_remote: bool,
     },
 }
@@ -820,7 +832,10 @@ fn load_env_file(path: &Path) -> Result<()> {
             continue;
         };
         let key = key.trim();
-        if key.is_empty() || env::var_os(key).is_some() {
+        if key.is_empty() {
+            continue;
+        }
+        if env::var_os(key).is_some() && !should_override_env_key(key) {
             continue;
         }
         let value = parse_env_value(value.trim());
@@ -829,6 +844,13 @@ fn load_env_file(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn should_override_env_key(key: &str) -> bool {
+    key.starts_with("LINKER_")
+        || key.starts_with("AUTOHOUR_")
+        || key.starts_with("TELEGRAM_")
+        || key.starts_with("SMTP_")
 }
 
 fn parse_env_value(value: &str) -> String {
@@ -897,6 +919,57 @@ fn default_cookie_file_path() -> Result<PathBuf> {
         return Ok(dir.join(COOKIE_FILE));
     }
     Ok(PathBuf::from(COOKIE_FILE))
+}
+
+fn instance_lock_path() -> Result<PathBuf> {
+    if let Some(dir) = ensure_app_support_dir()? {
+        return Ok(dir.join("autohour.lock"));
+    }
+    Ok(PathBuf::from("autohour.lock"))
+}
+
+fn log_file_path() -> Result<PathBuf> {
+    if let Some(dir) = ensure_app_support_dir()? {
+        let log_dir = dir.join("logs");
+        fs::create_dir_all(&log_dir)
+            .with_context(|| format!("failed to create log dir {}", log_dir.display()))?;
+        return Ok(log_dir.join("autohour.log"));
+    }
+    Ok(PathBuf::from("autohour.log"))
+}
+
+fn append_log_line(message: &str) {
+    let Ok(path) = log_file_path() else {
+        return;
+    };
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, format!("[{timestamp}] {message}\n").as_bytes()));
+}
+
+fn should_enforce_single_instance(cli: &Cli) -> bool {
+    bundled_resources_dir().is_some() || matches!(cli.command, Some(Commands::Tray))
+}
+
+fn acquire_instance_guard(cli: &Cli) -> Result<Option<File>> {
+    if !should_enforce_single_instance(cli) {
+        return Ok(None);
+    }
+    let path = instance_lock_path()?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open instance lock {}", path.display()))?;
+    if file.try_lock_exclusive().is_err() {
+        append_log_line("another Autohour instance is already running; exiting");
+        return Ok(None);
+    }
+    Ok(Some(file))
 }
 
 #[cfg(target_os = "macos")]
@@ -1432,26 +1505,17 @@ fn send_notifications(
 
 #[cfg(target_os = "macos")]
 fn send_macos_notification(title: &str, body: &str) -> Result<()> {
-    let script = format!(
-        "display notification {} with title {}",
-        apple_script_string(body),
-        apple_script_string(title)
-    );
-    let status = ProcessCommand::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .status()
-        .context("failed to invoke osascript for notification")?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("osascript notification exited with status {status}");
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn apple_script_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+    let _ = set_application("cc.linker.autohour");
+    let mut notification = Notification::new();
+    notification
+        .title(title)
+        .message(body)
+        .main_button(MainButton::SingleAction("显示"));
+    notification
+        .send()
+        .map_err(|err| anyhow!("failed to send macOS notification: {err}"))?;
+    append_log_line(&format!("notification sent via native macOS API: {title}"));
+    Ok(())
 }
 
 fn send_telegram_notification(
@@ -1567,6 +1631,30 @@ fn format_missing_notification_body(result: &MissingDailyResult) -> String {
         .collect::<Vec<_>>()
         .join("、");
     format!("检测到缺报：{dates}")
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_notification_work(
+    client: Client,
+    notifications: NotificationConfig,
+    work: NotificationWork,
+) {
+    thread::spawn(move || match work {
+        NotificationWork::Send {
+            title,
+            body,
+            notify_remote,
+        } => {
+            if let Err(err) = send_macos_notification(&title, &body) {
+                append_log_line(&format!("failed to send macOS notification: {err:#}"));
+            }
+            if notify_remote {
+                if let Err(err) = send_notifications(&client, &notifications, &title, &body) {
+                    append_log_line(&format!("failed to send remote notification: {err:#}"));
+                }
+            }
+        }
+    });
 }
 
 fn has_daily_report(snapshot: &DaySnapshot) -> bool {
@@ -1722,6 +1810,7 @@ fn run_tray_app(
                 event_loop.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
                 match build_tray_menu() {
                     Ok(menu) => {
+                        set_tray_busy_state(&menu, false, "状态：监控中");
                         tray_menu = Some(menu);
                         start_tray_reminder_loop(client.clone());
                     }
@@ -1795,10 +1884,15 @@ fn run_tray_app(
                             notify_remote,
                             ..
                         } => {
-                            let _ = send_macos_notification(&title, &body);
-                            if notify_remote {
-                                let _ = send_notifications(&client.client, &notifications, &title, &body);
-                            }
+                            dispatch_notification_work(
+                                client.client.clone(),
+                                notifications.clone(),
+                                NotificationWork::Send {
+                                    title,
+                                    body,
+                                    notify_remote,
+                                },
+                            );
                         }
                         TaskOutcome::Failure {
                             title,
@@ -1806,10 +1900,15 @@ fn run_tray_app(
                             notify_remote,
                             ..
                         } => {
-                            let _ = send_macos_notification(&title, &body);
-                            if notify_remote {
-                                let _ = send_notifications(&client.client, &notifications, &title, &body);
-                            }
+                            dispatch_notification_work(
+                                client.client.clone(),
+                                notifications.clone(),
+                                NotificationWork::Send {
+                                    title,
+                                    body,
+                                    notify_remote,
+                                },
+                            );
                         }
                     }
                 }
@@ -2104,9 +2203,21 @@ fn run_daemon(
     }
 }
 
-fn main() -> Result<()> {
+fn cli_from_runtime() -> Cli {
+    let mut args: Vec<_> = env::args_os().collect();
+    if args.len() == 1 && bundled_resources_dir().is_some() {
+        args.push("tray".into());
+    }
+    Cli::parse_from(args)
+}
+
+fn real_main() -> Result<()> {
     load_env_files()?;
-    let cli = Cli::parse();
+    let cli = cli_from_runtime();
+    let _instance_guard = acquire_instance_guard(&cli)?;
+    if should_enforce_single_instance(&cli) && _instance_guard.is_none() {
+        return Ok(());
+    }
     let (username, password) = env_credentials()?;
     let client = LinkerClient::new(username, password, default_cookie_file_path()?)?;
     let notifications = env_notification_config()?;
@@ -2216,6 +2327,20 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn main() -> Result<()> {
+    append_log_line("autohour starting");
+    match real_main() {
+        Ok(()) => {
+            append_log_line("autohour exited normally");
+            Ok(())
+        }
+        Err(err) => {
+            append_log_line(&format!("autohour error: {err:#}"));
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]

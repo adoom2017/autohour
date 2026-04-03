@@ -3,13 +3,28 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 RESOURCES_DIR="$SCRIPT_DIR/../Resources"
+APP_SUPPORT_DIR="$HOME/Library/Application Support/autohour"
+LOG_DIR="$APP_SUPPORT_DIR/logs"
+LOG_FILE="$LOG_DIR/autohour.log"
+
+mkdir -p "$LOG_DIR"
+exec >>"$LOG_FILE" 2>&1
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting Autohour.app launcher"
 
 if [ -z "${AUTOHOUR_ENV_FILE:-}" ] && [ -f "$RESOURCES_DIR/.env" ]; then
   export AUTOHOUR_ENV_FILE="$RESOURCES_DIR/.env"
 fi
 
+if [ -z "${AUTOHOUR_ENV_FILE:-}" ] && [ -f "$APP_SUPPORT_DIR/.env" ]; then
+  export AUTOHOUR_ENV_FILE="$APP_SUPPORT_DIR/.env"
+fi
+
 if [ -z "${AUTOHOUR_HOLIDAY_DIR:-}" ] && [ -d "$RESOURCES_DIR/holidays" ]; then
   export AUTOHOUR_HOLIDAY_DIR="$RESOURCES_DIR/holidays"
 fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] AUTOHOUR_ENV_FILE=${AUTOHOUR_ENV_FILE:-<unset>}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] AUTOHOUR_HOLIDAY_DIR=${AUTOHOUR_HOLIDAY_DIR:-<unset>}"
 
 exec "$RESOURCES_DIR/autohour-bin" tray
