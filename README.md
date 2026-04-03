@@ -25,6 +25,7 @@ export AUTOHOUR_LOG_DIR='/你的日志目录'
 
 ```bash
 export AUTOHOUR_SCHEDULE_AT='18:00'
+export AUTOHOUR_HOLIDAY_DIR=''
 export TELEGRAM_BOT_TOKEN=''
 export TELEGRAM_CHAT_ID=''
 export SMTP_HOST=''
@@ -62,6 +63,19 @@ cargo run -- check-missing
 cargo run -- check-missing --year 2026 --month 4
 ```
 
+启动 macOS 菜单栏应用：
+
+```bash
+cargo run -- tray
+```
+
+菜单栏模式会自动启用提醒：
+
+- 上午 `08:00-10:00` 检查昨天是否已填报
+- 下午 `18:00-20:00` 检查今天是否已填报
+- 未填报时每隔 `30` 分钟提醒一次
+- 如果这两个时间段内电脑休眠，恢复后会补做一次漏掉的检查
+
 前台定时执行：
 
 ```bash
@@ -97,6 +111,25 @@ cargo run -- add-man-hour \
 ```bash
 cargo build --release
 ./target/release/autohour
+```
+
+构建可分享的 macOS 应用：
+
+```bash
+./scripts/build-macos-app.sh
+```
+
+输出文件：
+
+```text
+dist/Autohour.app
+dist/Autohour.app.zip
+```
+
+生成占位应用图标：
+
+```bash
+./scripts/generate-placeholder-icon.sh
 ```
 
 ## 日志文件要求
@@ -170,6 +203,8 @@ holidays/2026.json
 
 如果缺少对应年份的节假日文件，`check-missing` 会直接报错。
 
+可用 `AUTOHOUR_HOLIDAY_DIR` 指定自定义节假日目录。
+
 ## 通知
 
 配置 Telegram 或 SMTP 环境变量后，程序会在这些场景发送通知：
@@ -177,6 +212,33 @@ holidays/2026.json
 - 提交成功
 - 提交失败
 - 检测到缺报日期
+- 菜单栏模式下也会显示 macOS 系统通知
+
+## macOS App 使用
+
+应用启动后会直接进入菜单栏模式。
+
+应用会按以下顺序加载配置：
+
+1. `AUTOHOUR_ENV_FILE` 指向的文件
+2. 当前目录下的 `.env`
+3. 可执行文件同目录下的 `.env`
+4. `.app` 内 `Contents/Resources/.env`
+5. `~/Library/Application Support/autohour/.env`
+
+如果你要分享给别人使用，推荐做法：
+
+- 把 `dist/Autohour.app.zip` 发给对方
+- 对方解压后，把自己的配置写到 `~/Library/Application Support/autohour/.env`
+- 节假日文件默认已随应用打包
+- 如需开机自动启动，可在菜单栏里点“开启开机自动启动”
+
+也可以命令行安装或卸载开机启动：
+
+```bash
+cargo run -- install-launch-agent
+cargo run -- uninstall-launch-agent
+```
 
 ## 常用命令
 

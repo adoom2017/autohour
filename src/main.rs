@@ -4,6 +4,8 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration as StdDuration;
@@ -28,6 +30,16 @@ use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
 use scraper::{Html, Selector};
 use serde::Serialize;
 use serde_json::{Value, json};
+#[cfg(target_os = "macos")]
+use tao::event::{Event, StartCause};
+#[cfg(target_os = "macos")]
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use tao::platform::macos::{ActivationPolicy, EventLoopWindowTargetExtMacOS};
+#[cfg(target_os = "macos")]
+use tray_icon::TrayIconBuilder;
+#[cfg(target_os = "macos")]
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
 const DEFAULT_SERVICE_URL: &str = "https://lh.i.linker.cc/1.UserCenter/Pages/Default.aspx";
 const WEEKSYSTEM_APP_URL: &str = "https://weeksystem.linker.cc/wap/index.html?v=1.2.5.5";
@@ -41,7 +53,22 @@ const UPDATE_DAILY_URL: &str = "https://weeksystem.linker.cc/api/Index/updateDai
 const DAILY_REPORT_API_URL: &str = "https://weeksystem.linker.cc/api/datareport/daily";
 const COOKIE_FILE: &str = ".linker_session.cookies.json";
 const HOLIDAY_DIR: &str = "holidays";
+const ENV_FILE: &str = ".env";
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+#[cfg(target_os = "macos")]
+const MENU_ID_SUBMIT_TODAY: &str = "submit_today";
+#[cfg(target_os = "macos")]
+const MENU_ID_CHECK_MISSING: &str = "check_missing";
+#[cfg(target_os = "macos")]
+const MENU_ID_REFRESH_LOGIN: &str = "refresh_login";
+#[cfg(target_os = "macos")]
+const MENU_ID_ENABLE_LOGIN: &str = "enable_login_item";
+#[cfg(target_os = "macos")]
+const MENU_ID_DISABLE_LOGIN: &str = "disable_login_item";
+#[cfg(target_os = "macos")]
+const MENU_ID_QUIT: &str = "quit";
+#[cfg(target_os = "macos")]
+const LAUNCH_AGENT_LABEL: &str = "cc.linker.autohour";
 
 #[derive(Parser)]
 #[command(name = "autohour")]
@@ -92,6 +119,12 @@ enum Commands {
         #[arg(long, help = "月份，默认当前月")]
         month: Option<u32>,
     },
+    #[command(about = "启动 macOS 菜单栏应用，并启用上午/晚上的自动日志提醒")]
+    Tray,
+    #[command(about = "安装开机自动启动的 LaunchAgent")]
+    InstallLaunchAgent,
+    #[command(about = "卸载开机自动启动的 LaunchAgent")]
+    UninstallLaunchAgent,
     #[command(visible_alias = "d", about = "以前台常驻方式按时间自动提交当天日志")]
     Daemon {
         #[arg(
@@ -176,6 +209,62 @@ struct EmailConfig {
     from: String,
     to: String,
     starttls: bool,
+}
+
+#[cfg(target_os = "macos")]
+enum TrayUserEvent {
+    SubmitToday,
+    CheckCurrentMonth,
+    RefreshLogin,
+    EnableLaunchAtLogin,
+    DisableLaunchAtLogin,
+    Quit,
+    TaskStarted(&'static str),
+    TaskFinished(TaskOutcome),
+}
+
+#[cfg(target_os = "macos")]
+enum TaskOutcome {
+    Success {
+        title: String,
+        body: String,
+        status: String,
+        notify_remote: bool,
+    },
+    Failure {
+        title: String,
+        body: String,
+        status: String,
+        notify_remote: bool,
+    },
+}
+
+#[cfg(target_os = "macos")]
+struct TrayMenu {
+    _tray: tray_icon::TrayIcon,
+    submit_item: MenuItem,
+    check_item: MenuItem,
+    login_item: MenuItem,
+    enable_login_item: MenuItem,
+    disable_login_item: MenuItem,
+    status_item: MenuItem,
+    quit_item: MenuItem,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ReminderState {
+    morning: ReminderSlotState,
+    evening: ReminderSlotState,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ReminderSlotState {
+    target_date: Option<NaiveDate>,
+    last_sent_at: Option<DateTime<Local>>,
+    observed_in_window: bool,
+    catchup_processed: bool,
 }
 
 #[derive(Clone)]
@@ -702,6 +791,272 @@ fn env_credentials() -> Result<(String, String)> {
     Ok((username, password))
 }
 
+fn load_env_files() -> Result<()> {
+    if let Ok(path) = env::var("AUTOHOUR_ENV_FILE") {
+        let env_path = PathBuf::from(path);
+        if env_path.is_file() {
+            load_env_file(&env_path)?;
+            return Ok(());
+        }
+    }
+    for candidate in default_env_candidates()? {
+        if candidate.is_file() {
+            load_env_file(&candidate)?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn load_env_file(path: &Path) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read env file {}", path.display()))?;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || env::var_os(key).is_some() {
+            continue;
+        }
+        let value = parse_env_value(value.trim());
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+    Ok(())
+}
+
+fn parse_env_value(value: &str) -> String {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn default_env_candidates() -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    candidates.push(PathBuf::from(ENV_FILE));
+    if let Ok(exe_dir) = executable_dir() {
+        candidates.push(exe_dir.join(ENV_FILE));
+        if let Some(resources_dir) = bundled_resources_dir() {
+            candidates.push(resources_dir.join(ENV_FILE));
+        }
+    }
+    if let Some(app_support_dir) = app_support_dir() {
+        candidates.push(app_support_dir.join(ENV_FILE));
+    }
+    Ok(candidates)
+}
+
+fn executable_dir() -> Result<PathBuf> {
+    let exe = env::current_exe().context("failed to locate current executable")?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("failed to locate executable directory"))
+}
+
+fn bundled_resources_dir() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let macos_dir = exe.parent()?;
+    let contents_dir = macos_dir.parent()?;
+    let resources_dir = contents_dir.join("Resources");
+    resources_dir.is_dir().then_some(resources_dir)
+}
+
+fn app_support_dir() -> Option<PathBuf> {
+    let home = env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("autohour"),
+    )
+}
+
+fn ensure_app_support_dir() -> Result<Option<PathBuf>> {
+    let Some(dir) = app_support_dir() else {
+        return Ok(None);
+    };
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create app support dir {}", dir.display()))?;
+    Ok(Some(dir))
+}
+
+fn default_cookie_file_path() -> Result<PathBuf> {
+    if let Some(dir) = ensure_app_support_dir()? {
+        return Ok(dir.join(COOKIE_FILE));
+    }
+    Ok(PathBuf::from(COOKIE_FILE))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agents_dir() -> Result<PathBuf> {
+    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join("Library").join("LaunchAgents"))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_plist_path() -> Result<PathBuf> {
+    Ok(launch_agents_dir()?.join(format!("{LAUNCH_AGENT_LABEL}.plist")))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_installed() -> bool {
+    launch_agent_plist_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn install_launch_agent() -> Result<PathBuf> {
+    let plist_path = launch_agent_plist_path()?;
+    let parent = plist_path
+        .parent()
+        .ok_or_else(|| anyhow!("failed to resolve LaunchAgents directory"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let executable = env::current_exe().context("failed to resolve current executable")?;
+    let env_file = default_env_candidates()?
+        .into_iter()
+        .find(|path| path.is_file())
+        .or_else(|| app_support_dir().map(|dir| dir.join(ENV_FILE)));
+    let holiday_dir = env::var("AUTOHOUR_HOLIDAY_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| bundled_resources_dir().map(|dir| dir.join(HOLIDAY_DIR)))
+        .or_else(|| app_support_dir().map(|dir| dir.join(HOLIDAY_DIR)));
+
+    let mut plist = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>cc.linker.autohour</string>
+  <key>ProgramArguments</key>
+  <array>
+"#,
+    );
+    plist.push_str(&format!(
+        "    <string>{}</string>\n    <string>tray</string>\n",
+        xml_escape(&executable.display().to_string())
+    ));
+    plist.push_str(
+        r#"  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+"#,
+    );
+    if env_file.is_some() || holiday_dir.is_some() {
+        plist.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
+        if let Some(env_file) = env_file {
+            plist.push_str(&format!(
+                "    <key>AUTOHOUR_ENV_FILE</key>\n    <string>{}</string>\n",
+                xml_escape(&env_file.display().to_string())
+            ));
+        }
+        if let Some(holiday_dir) = holiday_dir {
+            plist.push_str(&format!(
+                "    <key>AUTOHOUR_HOLIDAY_DIR</key>\n    <string>{}</string>\n",
+                xml_escape(&holiday_dir.display().to_string())
+            ));
+        }
+        plist.push_str("  </dict>\n");
+    }
+    plist.push_str("</dict>\n</plist>\n");
+
+    fs::write(&plist_path, plist)
+        .with_context(|| format!("failed to write {}", plist_path.display()))?;
+    let _ = ProcessCommand::new("launchctl")
+        .arg("unload")
+        .arg(&plist_path)
+        .status();
+    let status = ProcessCommand::new("launchctl")
+        .arg("load")
+        .arg("-w")
+        .arg(&plist_path)
+        .status()
+        .context("failed to execute launchctl load")?;
+    if !status.success() {
+        bail!("launchctl load failed for {}", plist_path.display());
+    }
+    Ok(plist_path)
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launch_agent() -> Result<PathBuf> {
+    let plist_path = launch_agent_plist_path()?;
+    if plist_path.is_file() {
+        let _ = ProcessCommand::new("launchctl")
+            .arg("unload")
+            .arg("-w")
+            .arg(&plist_path)
+            .status();
+        fs::remove_file(&plist_path)
+            .with_context(|| format!("failed to remove {}", plist_path.display()))?;
+    }
+    Ok(plist_path)
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn holiday_config_path(year: i32) -> Result<PathBuf> {
+    if let Ok(custom_dir) = env::var("AUTOHOUR_HOLIDAY_DIR") {
+        let candidate = PathBuf::from(custom_dir).join(format!("{year}.json"));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    let cwd_candidate = PathBuf::from(HOLIDAY_DIR).join(format!("{year}.json"));
+    if cwd_candidate.is_file() {
+        return Ok(cwd_candidate);
+    }
+
+    if let Some(resources_dir) = bundled_resources_dir() {
+        let candidate = resources_dir.join(HOLIDAY_DIR).join(format!("{year}.json"));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    if let Ok(exe_dir) = executable_dir() {
+        let candidate = exe_dir.join(HOLIDAY_DIR).join(format!("{year}.json"));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    if let Some(app_support) = app_support_dir() {
+        let candidate = app_support.join(HOLIDAY_DIR).join(format!("{year}.json"));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    bail!("holiday calendar for {year} is missing; expected holidays/{year}.json in the working directory, app resources, or AUTOHOUR_HOLIDAY_DIR")
+}
+
 fn env_project_id() -> Result<i64> {
     env::var("LINKER_PROJECT_ID")
         .context("missing LINKER_PROJECT_ID")?
@@ -876,13 +1231,7 @@ struct HolidayCalendar {
 }
 
 fn china_holiday_calendar(year: i32) -> Result<HolidayCalendar> {
-    let path = PathBuf::from(HOLIDAY_DIR).join(format!("{year}.json"));
-    if !path.is_file() {
-        bail!(
-            "holiday calendar for {year} is missing: {}; add the year's official China holiday config before running check-missing",
-            path.display()
-        );
-    }
+    let path = holiday_config_path(year)?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("failed to read holiday calendar {}", path.display()))?;
     let config: HolidayConfig = serde_json::from_str(&content)
@@ -1049,6 +1398,15 @@ fn execute_submit(client: &LinkerClient, target_date: NaiveDate, out_work: &str)
     client.submit_from_log(&parsed_log, env_project_id()?, out_work)
 }
 
+fn execute_check_missing(
+    client: &LinkerClient,
+    year: Option<i32>,
+    month: Option<u32>,
+) -> Result<MissingDailyResult> {
+    let now = Local::now().date_naive();
+    client.check_missing_daily(year.unwrap_or(now.year()), month.unwrap_or(now.month()))
+}
+
 fn send_notifications(
     client: &Client,
     config: &NotificationConfig,
@@ -1070,6 +1428,30 @@ fn send_notifications(
         return Ok(());
     }
     bail!(failures.join("; "))
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_notification(title: &str, body: &str) -> Result<()> {
+    let script = format!(
+        "display notification {} with title {}",
+        apple_script_string(body),
+        apple_script_string(title)
+    );
+    let status = ProcessCommand::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+        .context("failed to invoke osascript for notification")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("osascript notification exited with status {status}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apple_script_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
 fn send_telegram_notification(
@@ -1174,6 +1556,512 @@ fn summarize_missing_daily(result: &MissingDailyResult) -> String {
     )
 }
 
+fn format_missing_notification_body(result: &MissingDailyResult) -> String {
+    if result.missing_workdays.is_empty() {
+        return format!("{:02}月暂无缺报", result.month);
+    }
+    let dates = result
+        .missing_workdays
+        .iter()
+        .map(|day| format!("{}月{}号", result.month, day))
+        .collect::<Vec<_>>()
+        .join("、");
+    format!("检测到缺报：{dates}")
+}
+
+fn has_daily_report(snapshot: &DaySnapshot) -> bool {
+    snapshot
+        .daily
+        .as_ref()
+        .and_then(|daily| daily.get("id"))
+        .is_some_and(|id| !id.is_null())
+}
+
+#[cfg(target_os = "macos")]
+fn is_between_hours(time: NaiveTime, start_hour: u32, end_hour: u32) -> bool {
+    let Some(start) = NaiveTime::from_hms_opt(start_hour, 0, 0) else {
+        return false;
+    };
+    let Some(end) = NaiveTime::from_hms_opt(end_hour, 0, 0) else {
+        return false;
+    };
+    time >= start && time < end
+}
+
+#[cfg(target_os = "macos")]
+fn reset_reminder_slot_for_date(slot: &mut ReminderSlotState, target_date: NaiveDate) {
+    if slot.target_date != Some(target_date) {
+        slot.target_date = Some(target_date);
+        slot.last_sent_at = None;
+        slot.observed_in_window = false;
+        slot.catchup_processed = false;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reminder_due(slot: &ReminderSlotState, now: DateTime<Local>) -> bool {
+    slot.last_sent_at
+        .map(|sent_at| now - sent_at >= Duration::minutes(30))
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+fn mark_reminder_sent(slot: &mut ReminderSlotState, now: DateTime<Local>) {
+    slot.last_sent_at = Some(now);
+}
+
+#[cfg(target_os = "macos")]
+fn start_tray_reminder_loop(client: LinkerClient) {
+    thread::spawn(move || {
+        let mut state = ReminderState::default();
+        loop {
+            if let Err(err) = process_tray_reminders(&client, &mut state) {
+                eprintln!("reminder check failed: {err}");
+            }
+            thread::sleep(StdDuration::from_secs(60));
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn process_tray_reminders(client: &LinkerClient, state: &mut ReminderState) -> Result<()> {
+    let now = Local::now();
+    let today = now.date_naive();
+
+    process_time_window_reminder(
+        client,
+        &mut state.morning,
+        now,
+        today - Duration::days(1),
+        "昨天",
+        8,
+        10,
+    )?;
+    process_time_window_reminder(client, &mut state.evening, now, today, "今天", 18, 20)?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn process_time_window_reminder(
+    client: &LinkerClient,
+    slot: &mut ReminderSlotState,
+    now: DateTime<Local>,
+    target_date: NaiveDate,
+    label: &str,
+    start_hour: u32,
+    end_hour: u32,
+) -> Result<()> {
+    reset_reminder_slot_for_date(slot, target_date);
+    let in_window = is_between_hours(now.time(), start_hour, end_hour);
+    if in_window {
+        slot.observed_in_window = true;
+        if reminder_due(slot, now) {
+            send_missing_daily_reminder(client, slot, now, target_date, label)?;
+        }
+        return Ok(());
+    }
+
+    let Some(end_time) = NaiveTime::from_hms_opt(end_hour, 0, 0) else {
+        return Ok(());
+    };
+    if now.time() >= end_time && !slot.observed_in_window && !slot.catchup_processed {
+        slot.catchup_processed = true;
+        send_missing_daily_reminder(client, slot, now, target_date, label)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn send_missing_daily_reminder(
+    client: &LinkerClient,
+    slot: &mut ReminderSlotState,
+    now: DateTime<Local>,
+    target_date: NaiveDate,
+    label: &str,
+) -> Result<()> {
+    let snapshot = client.get_day_snapshot(target_date)?;
+    if has_daily_report(&snapshot) {
+        return Ok(());
+    }
+    let body = format!(
+        "{}{}月{}号还没有填报日志",
+        label,
+        target_date.month(),
+        target_date.day()
+    );
+    send_macos_notification("autohour 日报提醒", &body)?;
+    mark_reminder_sent(slot, now);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_tray_app(
+    client: LinkerClient,
+    notifications: NotificationConfig,
+    default_out_work: String,
+) -> Result<()> {
+    let event_loop = EventLoopBuilder::<TrayUserEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+
+    MenuEvent::set_event_handler(Some({
+        let proxy = proxy.clone();
+        move |event: MenuEvent| {
+            let _ = proxy.send_event(map_menu_event(event));
+        }
+    }));
+
+    let mut tray_menu: Option<TrayMenu> = None;
+    let mut busy = false;
+
+    event_loop.run(move |event, event_loop, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                event_loop.set_activation_policy_at_runtime(ActivationPolicy::Accessory);
+                match build_tray_menu() {
+                    Ok(menu) => {
+                        tray_menu = Some(menu);
+                        start_tray_reminder_loop(client.clone());
+                    }
+                    Err(err) => {
+                        eprintln!("failed to initialize tray: {err}");
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+            }
+            Event::UserEvent(user_event) => match user_event {
+                TrayUserEvent::SubmitToday => {
+                    if !busy {
+                        busy = true;
+                        launch_submit_today_task(
+                            proxy.clone(),
+                            client.clone(),
+                            notifications.clone(),
+                            default_out_work.clone(),
+                        );
+                    }
+                }
+                TrayUserEvent::CheckCurrentMonth => {
+                    if !busy {
+                        busy = true;
+                        launch_check_missing_task(
+                            proxy.clone(),
+                            client.clone(),
+                            notifications.clone(),
+                        );
+                    }
+                }
+                TrayUserEvent::RefreshLogin => {
+                    if !busy {
+                        busy = true;
+                        launch_refresh_login_task(proxy.clone(), client.clone(), notifications.clone());
+                    }
+                }
+                TrayUserEvent::EnableLaunchAtLogin => {
+                    if !busy {
+                        busy = true;
+                        launch_install_launch_agent_task(proxy.clone());
+                    }
+                }
+                TrayUserEvent::DisableLaunchAtLogin => {
+                    if !busy {
+                        busy = true;
+                        launch_uninstall_launch_agent_task(proxy.clone());
+                    }
+                }
+                TrayUserEvent::Quit => {
+                    *control_flow = ControlFlow::Exit;
+                }
+                TrayUserEvent::TaskStarted(status) => {
+                    if let Some(menu) = tray_menu.as_ref() {
+                        set_tray_busy_state(menu, true, status);
+                    }
+                }
+                TrayUserEvent::TaskFinished(outcome) => {
+                    busy = false;
+                    if let Some(menu) = tray_menu.as_ref() {
+                        let status = match &outcome {
+                            TaskOutcome::Success { status, .. } => status.as_str(),
+                            TaskOutcome::Failure { status, .. } => status.as_str(),
+                        };
+                        set_tray_busy_state(menu, false, status);
+                    }
+                    match outcome {
+                        TaskOutcome::Success {
+                            title,
+                            body,
+                            notify_remote,
+                            ..
+                        } => {
+                            let _ = send_macos_notification(&title, &body);
+                            if notify_remote {
+                                let _ = send_notifications(&client.client, &notifications, &title, &body);
+                            }
+                        }
+                        TaskOutcome::Failure {
+                            title,
+                            body,
+                            notify_remote,
+                            ..
+                        } => {
+                            let _ = send_macos_notification(&title, &body);
+                            if notify_remote {
+                                let _ = send_notifications(&client.client, &notifications, &title, &body);
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn build_tray_menu() -> Result<TrayMenu> {
+    let status_item = MenuItem::new("状态：监控中", false, None);
+    let submit_item = MenuItem::with_id(MENU_ID_SUBMIT_TODAY, "提交今天日志", true, None);
+    let check_item = MenuItem::with_id(MENU_ID_CHECK_MISSING, "检查本月缺报", true, None);
+    let login_item = MenuItem::with_id(MENU_ID_REFRESH_LOGIN, "刷新登录会话", true, None);
+    let enable_login_item =
+        MenuItem::with_id(MENU_ID_ENABLE_LOGIN, "开启开机自动启动", true, None);
+    let disable_login_item =
+        MenuItem::with_id(MENU_ID_DISABLE_LOGIN, "关闭开机自动启动", true, None);
+    let quit_item = MenuItem::with_id(MENU_ID_QUIT, "退出", true, None);
+    let separator_top = PredefinedMenuItem::separator();
+    let separator_middle = PredefinedMenuItem::separator();
+    let separator_bottom = PredefinedMenuItem::separator();
+    let menu = Menu::new();
+    menu.append(&status_item)?;
+    menu.append(&separator_top)?;
+    menu.append(&submit_item)?;
+    menu.append(&check_item)?;
+    menu.append(&login_item)?;
+    menu.append(&separator_middle)?;
+    menu.append(&enable_login_item)?;
+    menu.append(&disable_login_item)?;
+    menu.append(&separator_bottom)?;
+    menu.append(&quit_item)?;
+
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("autohour")
+        .with_icon(build_tray_icon()?)
+        .with_icon_as_template(true)
+        .build()
+        .context("failed to build tray icon")?;
+
+    Ok(TrayMenu {
+        _tray: tray,
+        submit_item,
+        check_item,
+        login_item,
+        enable_login_item,
+        disable_login_item,
+        status_item,
+        quit_item,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn map_menu_event(event: MenuEvent) -> TrayUserEvent {
+    let id = event.id.0.as_ref();
+    match id {
+        MENU_ID_SUBMIT_TODAY => TrayUserEvent::SubmitToday,
+        MENU_ID_CHECK_MISSING => TrayUserEvent::CheckCurrentMonth,
+        MENU_ID_REFRESH_LOGIN => TrayUserEvent::RefreshLogin,
+        MENU_ID_ENABLE_LOGIN => TrayUserEvent::EnableLaunchAtLogin,
+        MENU_ID_DISABLE_LOGIN => TrayUserEvent::DisableLaunchAtLogin,
+        MENU_ID_QUIT => TrayUserEvent::Quit,
+        _ => TrayUserEvent::TaskStarted("状态：就绪"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_tray_busy_state(menu: &TrayMenu, busy: bool, status: &str) {
+    menu.submit_item.set_enabled(!busy);
+    menu.check_item.set_enabled(!busy);
+    menu.login_item.set_enabled(!busy);
+    let installed = launch_agent_installed();
+    menu.enable_login_item.set_enabled(!busy && !installed);
+    menu.disable_login_item.set_enabled(!busy && installed);
+    menu.quit_item.set_enabled(true);
+    menu.status_item.set_text(status);
+}
+
+#[cfg(target_os = "macos")]
+fn build_tray_icon() -> Result<tray_icon::Icon> {
+    let width = 18;
+    let height = 18;
+    let mut rgba = vec![0_u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let draw = (x >= 3 && x <= 4 && y >= 5 && y <= 13)
+                || (x >= 8 && x <= 9 && y >= 3 && y <= 13)
+                || (x >= 13 && x <= 14 && y >= 7 && y <= 13);
+            if draw {
+                let idx = (y * width + x) * 4;
+                rgba[idx] = 0;
+                rgba[idx + 1] = 0;
+                rgba[idx + 2] = 0;
+                rgba[idx + 3] = 255;
+            }
+        }
+    }
+    tray_icon::Icon::from_rgba(rgba, width as u32, height as u32)
+        .context("failed to create tray icon")
+}
+
+#[cfg(target_os = "macos")]
+fn launch_submit_today_task(
+    proxy: EventLoopProxy<TrayUserEvent>,
+    client: LinkerClient,
+    notifications: NotificationConfig,
+    out_work: String,
+) {
+    thread::spawn(move || {
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在提交今天日志"));
+        let target_date = Local::now().date_naive();
+        let outcome = match execute_submit(&client, target_date, &out_work) {
+            Ok(result) => TaskOutcome::Success {
+                title: "autohour 提交成功".to_string(),
+                body: summarize_result(&result),
+                status: "状态：最近一次提交成功".to_string(),
+                notify_remote: true,
+            },
+            Err(err) => TaskOutcome::Failure {
+                title: "autohour 提交失败".to_string(),
+                body: format!("日期: {target_date}\n错误: {err}"),
+                status: "状态：最近一次提交失败".to_string(),
+                notify_remote: true,
+            },
+        };
+        let _ = notifications;
+        let _ = proxy.send_event(TrayUserEvent::TaskFinished(outcome));
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn launch_check_missing_task(
+    proxy: EventLoopProxy<TrayUserEvent>,
+    client: LinkerClient,
+    notifications: NotificationConfig,
+) {
+    thread::spawn(move || {
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在检查缺报"));
+        let outcome = match execute_check_missing(&client, None, None) {
+            Ok(result) => {
+                let has_missing = !result.missing_workdays.is_empty();
+                let title = if has_missing {
+                    "autohour 检测到缺报"
+                } else {
+                    "autohour 缺报检查完成"
+                };
+                TaskOutcome::Success {
+                    title: title.to_string(),
+                    body: format_missing_notification_body(&result),
+                    status: if has_missing {
+                        "状态：检测到缺报".to_string()
+                    } else {
+                        "状态：本月暂无缺报".to_string()
+                    },
+                    notify_remote: has_missing,
+                }
+            }
+            Err(err) => TaskOutcome::Failure {
+                title: "autohour 缺报检查失败".to_string(),
+                body: err.to_string(),
+                status: "状态：缺报检查失败".to_string(),
+                notify_remote: true,
+            },
+        };
+        let _ = notifications;
+        let _ = proxy.send_event(TrayUserEvent::TaskFinished(outcome));
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn launch_refresh_login_task(
+    proxy: EventLoopProxy<TrayUserEvent>,
+    client: LinkerClient,
+    notifications: NotificationConfig,
+) {
+    thread::spawn(move || {
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在刷新登录会话"));
+        let outcome = match client.relogin() {
+            Ok((cookie_name, _cookie_value)) => TaskOutcome::Success {
+                title: "autohour 登录成功".to_string(),
+                body: format!("已刷新会话 cookie: {cookie_name}"),
+                status: "状态：登录会话已刷新".to_string(),
+                notify_remote: false,
+            },
+            Err(err) => TaskOutcome::Failure {
+                title: "autohour 登录失败".to_string(),
+                body: err.to_string(),
+                status: "状态：登录刷新失败".to_string(),
+                notify_remote: true,
+            },
+        };
+        let _ = notifications;
+        let _ = proxy.send_event(TrayUserEvent::TaskFinished(outcome));
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn launch_install_launch_agent_task(proxy: EventLoopProxy<TrayUserEvent>) {
+    thread::spawn(move || {
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在开启开机启动"));
+        let outcome = match install_launch_agent() {
+            Ok(path) => TaskOutcome::Success {
+                title: "autohour 已开启开机启动".to_string(),
+                body: format!("已安装启动项：{}", path.display()),
+                status: "状态：已开启开机启动".to_string(),
+                notify_remote: false,
+            },
+            Err(err) => TaskOutcome::Failure {
+                title: "autohour 开机启动设置失败".to_string(),
+                body: err.to_string(),
+                status: "状态：开机启动设置失败".to_string(),
+                notify_remote: false,
+            },
+        };
+        let _ = proxy.send_event(TrayUserEvent::TaskFinished(outcome));
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn launch_uninstall_launch_agent_task(proxy: EventLoopProxy<TrayUserEvent>) {
+    thread::spawn(move || {
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在关闭开机启动"));
+        let outcome = match uninstall_launch_agent() {
+            Ok(path) => TaskOutcome::Success {
+                title: "autohour 已关闭开机启动".to_string(),
+                body: format!("已移除启动项：{}", path.display()),
+                status: "状态：已关闭开机启动".to_string(),
+                notify_remote: false,
+            },
+            Err(err) => TaskOutcome::Failure {
+                title: "autohour 关闭开机启动失败".to_string(),
+                body: err.to_string(),
+                status: "状态：关闭开机启动失败".to_string(),
+                notify_remote: false,
+            },
+        };
+        let _ = proxy.send_event(TrayUserEvent::TaskFinished(outcome));
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_tray_app(
+    _client: LinkerClient,
+    _notifications: NotificationConfig,
+    _default_out_work: String,
+) -> Result<()> {
+    bail!("tray mode is only supported on macOS")
+}
+
 fn run_daemon(
     client: &LinkerClient,
     schedule_time: NaiveTime,
@@ -1217,9 +2105,10 @@ fn run_daemon(
 }
 
 fn main() -> Result<()> {
+    load_env_files()?;
     let cli = Cli::parse();
     let (username, password) = env_credentials()?;
-    let client = LinkerClient::new(username, password, PathBuf::from(COOKIE_FILE))?;
+    let client = LinkerClient::new(username, password, default_cookie_file_path()?)?;
     let notifications = env_notification_config()?;
 
     match cli.command {
@@ -1272,11 +2161,7 @@ fn main() -> Result<()> {
             );
         }
         Some(Commands::CheckMissing { year, month }) => {
-            let now = Local::now().date_naive();
-            let result = client.check_missing_daily(
-                year.unwrap_or(now.year()),
-                month.unwrap_or(now.month()),
-            )?;
+            let result = execute_check_missing(&client, year, month)?;
             print_json(&result)?;
             if !result.missing_workdays.is_empty() {
                 let _ = send_notifications(
@@ -1285,6 +2170,39 @@ fn main() -> Result<()> {
                     "autohour 检测到缺报",
                     &summarize_missing_daily(&result),
                 );
+            }
+        }
+        Some(Commands::Tray) => {
+            run_tray_app(client, notifications, cli.out_work)?;
+        }
+        Some(Commands::InstallLaunchAgent) => {
+            #[cfg(target_os = "macos")]
+            {
+                let path = install_launch_agent()?;
+                print_json(&json!({
+                    "ok": true,
+                    "launch_agent": path,
+                    "enabled": true
+                }))?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                bail!("install-launch-agent is only supported on macOS");
+            }
+        }
+        Some(Commands::UninstallLaunchAgent) => {
+            #[cfg(target_os = "macos")]
+            {
+                let path = uninstall_launch_agent()?;
+                print_json(&json!({
+                    "ok": true,
+                    "launch_agent": path,
+                    "enabled": false
+                }))?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                bail!("uninstall-launch-agent is only supported on macOS");
             }
         }
         Some(Commands::Daemon { at }) => {
@@ -1396,5 +2314,30 @@ mod tests {
         assert_eq!(parsed.len(), 4);
         assert!(parsed.contains(&NaiveDate::from_ymd_opt(2026, 4, 4).unwrap()));
         assert!(parsed.contains(&NaiveDate::from_ymd_opt(2026, 5, 9).unwrap()));
+    }
+
+    #[test]
+    fn detects_existing_daily_report() {
+        let snapshot = DaySnapshot {
+            daily: Some(json!({"id": 123})),
+            workhour: Vec::new(),
+        };
+        assert!(has_daily_report(&snapshot));
+
+        let snapshot = DaySnapshot {
+            daily: Some(json!({})),
+            workhour: Vec::new(),
+        };
+        assert!(!has_daily_report(&snapshot));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn matches_reminder_windows() {
+        assert!(is_between_hours(NaiveTime::from_hms_opt(8, 0, 0).unwrap(), 8, 10));
+        assert!(is_between_hours(NaiveTime::from_hms_opt(9, 59, 0).unwrap(), 8, 10));
+        assert!(!is_between_hours(NaiveTime::from_hms_opt(10, 0, 0).unwrap(), 8, 10));
+        assert!(is_between_hours(NaiveTime::from_hms_opt(18, 0, 0).unwrap(), 18, 20));
+        assert!(!is_between_hours(NaiveTime::from_hms_opt(20, 0, 0).unwrap(), 18, 20));
     }
 }

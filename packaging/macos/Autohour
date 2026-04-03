@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+RESOURCES_DIR="$SCRIPT_DIR/../Resources"
+
+if [ -z "${AUTOHOUR_ENV_FILE:-}" ] && [ -f "$RESOURCES_DIR/.env" ]; then
+  export AUTOHOUR_ENV_FILE="$RESOURCES_DIR/.env"
+fi
+
+if [ -z "${AUTOHOUR_HOLIDAY_DIR:-}" ] && [ -d "$RESOURCES_DIR/holidays" ]; then
+  export AUTOHOUR_HOLIDAY_DIR="$RESOURCES_DIR/holidays"
+fi
+
+exec "$RESOURCES_DIR/autohour-bin" tray
