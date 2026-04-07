@@ -16,11 +16,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveTime, TimeZone};
 use clap::{Parser, Subcommand};
 use cookie_store::CookieStore;
+use fs2::FileExt;
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
+#[cfg(target_os = "macos")]
+use mac_notification_sys::{MainButton, Notification, set_application};
 use regex::Regex;
-use fs2::FileExt;
 use reqwest::Method;
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::cookie::CookieStore as _;
@@ -33,8 +35,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 #[cfg(target_os = "macos")]
 use tao::event::{Event, StartCause};
-#[cfg(target_os = "macos")]
-use mac_notification_sys::{MainButton, Notification, set_application};
 #[cfg(target_os = "macos")]
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 #[cfg(target_os = "macos")]
@@ -72,6 +72,8 @@ const MENU_ID_DISABLE_LOGIN: &str = "disable_login_item";
 const MENU_ID_QUIT: &str = "quit";
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "cc.linker.autohour";
+#[cfg(target_os = "macos")]
+const REMINDER_MAX_RETRIES: u32 = 3;
 
 #[derive(Parser)]
 #[command(name = "autohour")]
@@ -277,6 +279,9 @@ struct ReminderSlotState {
     last_sent_at: Option<DateTime<Local>>,
     observed_in_window: bool,
     catchup_processed: bool,
+    report_confirmed: bool,
+    consecutive_failures: u32,
+    failure_notified: bool,
 }
 
 #[derive(Clone)]
@@ -294,6 +299,8 @@ impl LinkerClient {
         let client = ClientBuilder::new()
             .cookie_provider(cookie_store.clone())
             .redirect(reqwest::redirect::Policy::limited(10))
+            .connect_timeout(StdDuration::from_secs(10))
+            .timeout(StdDuration::from_secs(30))
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
@@ -947,7 +954,9 @@ fn append_log_line(message: &str) {
         .create(true)
         .append(true)
         .open(&path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, format!("[{timestamp}] {message}\n").as_bytes()));
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, format!("[{timestamp}] {message}\n").as_bytes())
+        });
 }
 
 fn should_enforce_single_instance(cli: &Cli) -> bool {
@@ -996,8 +1005,7 @@ fn install_launch_agent() -> Result<PathBuf> {
     let parent = plist_path
         .parent()
         .ok_or_else(|| anyhow!("failed to resolve LaunchAgents directory"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
     let executable = env::current_exe().context("failed to resolve current executable")?;
     let env_file = default_env_candidates()?
@@ -1127,7 +1135,9 @@ fn holiday_config_path(year: i32) -> Result<PathBuf> {
         }
     }
 
-    bail!("holiday calendar for {year} is missing; expected holidays/{year}.json in the working directory, app resources, or AUTOHOUR_HOLIDAY_DIR")
+    bail!(
+        "holiday calendar for {year} is missing; expected holidays/{year}.json in the working directory, app resources, or AUTOHOUR_HOLIDAY_DIR"
+    )
 }
 
 fn env_project_id() -> Result<i64> {
@@ -1226,6 +1236,12 @@ fn next_run_after(now: DateTime<Local>, schedule_time: NaiveTime) -> Result<Date
         }
     }
     bail!("failed to compute next scheduled run")
+}
+
+fn sleep_duration_until(now: DateTime<Local>, target: DateTime<Local>) -> Result<StdDuration> {
+    (target - now)
+        .to_std()
+        .context("failed to compute sleep duration")
 }
 
 fn resolve_time_token(target_date: NaiveDate) -> Result<&'static str> {
@@ -1536,7 +1552,9 @@ fn send_telegram_notification(
         }))
         .send()
         .context("failed to send telegram request")?;
-    let value: Value = response.json().context("failed to parse telegram response")?;
+    let value: Value = response
+        .json()
+        .context("failed to parse telegram response")?;
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         return Ok(());
     }
@@ -1545,15 +1563,20 @@ fn send_telegram_notification(
 
 fn send_email_notification(config: &EmailConfig, title: &str, body: &str) -> Result<()> {
     let email = Message::builder()
-        .from(config.from.parse::<Mailbox>().context("invalid SMTP_FROM address")?)
-        .to(config.to.parse::<Mailbox>().context("invalid SMTP_TO address")?)
+        .from(
+            config
+                .from
+                .parse::<Mailbox>()
+                .context("invalid SMTP_FROM address")?,
+        )
+        .to(config
+            .to
+            .parse::<Mailbox>()
+            .context("invalid SMTP_TO address")?)
         .subject(title)
         .body(body.to_string())
         .context("failed to build email message")?;
-    let credentials = Credentials::new(
-        config.smtp_username.clone(),
-        config.smtp_password.clone(),
-    );
+    let credentials = Credentials::new(config.smtp_username.clone(), config.smtp_password.clone());
     let builder = if config.starttls {
         SmtpTransport::relay(&config.smtp_host).context("failed to create SMTP relay")?
     } else {
@@ -1683,11 +1706,17 @@ fn reset_reminder_slot_for_date(slot: &mut ReminderSlotState, target_date: Naive
         slot.last_sent_at = None;
         slot.observed_in_window = false;
         slot.catchup_processed = false;
+        slot.report_confirmed = false;
+        slot.consecutive_failures = 0;
+        slot.failure_notified = false;
     }
 }
 
 #[cfg(target_os = "macos")]
 fn reminder_due(slot: &ReminderSlotState, now: DateTime<Local>) -> bool {
+    if slot.report_confirmed {
+        return false;
+    }
     slot.last_sent_at
         .map(|sent_at| now - sent_at >= Duration::minutes(30))
         .unwrap_or(true)
@@ -1696,25 +1725,83 @@ fn reminder_due(slot: &ReminderSlotState, now: DateTime<Local>) -> bool {
 #[cfg(target_os = "macos")]
 fn mark_reminder_sent(slot: &mut ReminderSlotState, now: DateTime<Local>) {
     slot.last_sent_at = Some(now);
+    slot.report_confirmed = false;
+    slot.catchup_processed = false;
+    slot.consecutive_failures = 0;
+    slot.failure_notified = false;
+}
+
+#[cfg(target_os = "macos")]
+fn mark_report_confirmed(slot: &mut ReminderSlotState, now: DateTime<Local>) {
+    slot.last_sent_at = Some(now);
+    slot.report_confirmed = true;
+    slot.catchup_processed = true;
+    slot.consecutive_failures = 0;
+    slot.failure_notified = false;
+}
+
+#[cfg(target_os = "macos")]
+fn mark_reminder_failure(slot: &mut ReminderSlotState) {
+    slot.consecutive_failures = slot.consecutive_failures.saturating_add(1);
+}
+
+#[cfg(target_os = "macos")]
+fn reminder_retry_allowed(slot: &ReminderSlotState) -> bool {
+    slot.consecutive_failures < REMINDER_MAX_RETRIES
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_notify_reminder_failure(
+    slot: &mut ReminderSlotState,
+    label: &str,
+    target_date: NaiveDate,
+) {
+    if slot.failure_notified || slot.consecutive_failures < REMINDER_MAX_RETRIES {
+        return;
+    }
+    slot.failure_notified = true;
+    let body = format!(
+        "{}{}月{}号日志提醒失败，已停止重试，等待下一个窗口期",
+        label,
+        target_date.month(),
+        target_date.day()
+    );
+    let _ = send_macos_notification("autohour 提醒失败", &body);
+    append_log_line(&body);
 }
 
 #[cfg(target_os = "macos")]
 fn start_tray_reminder_loop(client: LinkerClient) {
     thread::spawn(move || {
         let mut state = ReminderState::default();
+        let mut consecutive_errors = 0_u32;
         loop {
-            if let Err(err) = process_tray_reminders(&client, &mut state) {
-                eprintln!("reminder check failed: {err}");
-            }
-            thread::sleep(StdDuration::from_secs(60));
+            let sleep_secs = match process_tray_reminders(&client, &mut state) {
+                Ok(seconds) => {
+                    consecutive_errors = 0;
+                    seconds
+                }
+                Err(err) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let backoff = reminder_error_backoff_secs(consecutive_errors);
+                    append_log_line(&format!(
+                        "reminder loop backing off (attempt {}) for {}s after error: {err:#}",
+                        consecutive_errors, backoff
+                    ));
+                    backoff
+                }
+            };
+            thread::sleep(StdDuration::from_secs(sleep_secs));
         }
     });
 }
 
 #[cfg(target_os = "macos")]
-fn process_tray_reminders(client: &LinkerClient, state: &mut ReminderState) -> Result<()> {
+fn process_tray_reminders(client: &LinkerClient, state: &mut ReminderState) -> Result<u64> {
     let now = Local::now();
     let today = now.date_naive();
+    let in_morning_window = is_between_hours(now.time(), 8, 10);
+    let in_evening_window = is_between_hours(now.time(), 18, 20);
 
     process_time_window_reminder(
         client,
@@ -1727,7 +1814,21 @@ fn process_tray_reminders(client: &LinkerClient, state: &mut ReminderState) -> R
     )?;
     process_time_window_reminder(client, &mut state.evening, now, today, "今天", 18, 20)?;
 
-    Ok(())
+    Ok(if in_morning_window || in_evening_window {
+        60
+    } else {
+        300
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn reminder_error_backoff_secs(consecutive_errors: u32) -> u64 {
+    match consecutive_errors {
+        0 | 1 => 300,
+        2 => 600,
+        3 => 900,
+        _ => 1800,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1744,8 +1845,27 @@ fn process_time_window_reminder(
     let in_window = is_between_hours(now.time(), start_hour, end_hour);
     if in_window {
         slot.observed_in_window = true;
-        if reminder_due(slot, now) {
-            send_missing_daily_reminder(client, slot, now, target_date, label)?;
+        if reminder_due(slot, now) && reminder_retry_allowed(slot) {
+            if let Err(err) = send_missing_daily_reminder(client, slot, now, target_date, label) {
+                mark_reminder_failure(slot);
+                append_log_line(&format!(
+                    "reminder send failed for {} {}-{:02}-{:02} (attempt {}/{}): {err:#}",
+                    label,
+                    target_date.year(),
+                    target_date.month(),
+                    target_date.day(),
+                    slot.consecutive_failures,
+                    REMINDER_MAX_RETRIES
+                ));
+                maybe_notify_reminder_failure(slot, label, target_date);
+                return Err(err.context(format!(
+                    "failed to process {} reminder for {}-{:02}-{:02}",
+                    label,
+                    target_date.year(),
+                    target_date.month(),
+                    target_date.day()
+                )));
+            }
         }
         return Ok(());
     }
@@ -1753,9 +1873,36 @@ fn process_time_window_reminder(
     let Some(end_time) = NaiveTime::from_hms_opt(end_hour, 0, 0) else {
         return Ok(());
     };
-    if now.time() >= end_time && !slot.observed_in_window && !slot.catchup_processed {
-        slot.catchup_processed = true;
-        send_missing_daily_reminder(client, slot, now, target_date, label)?;
+    if now.time() >= end_time
+        && !slot.observed_in_window
+        && !slot.catchup_processed
+        && reminder_retry_allowed(slot)
+    {
+        match send_missing_daily_reminder(client, slot, now, target_date, label) {
+            Ok(()) => {
+                slot.catchup_processed = true;
+            }
+            Err(err) => {
+                mark_reminder_failure(slot);
+                append_log_line(&format!(
+                    "catchup reminder failed for {} {}-{:02}-{:02} (attempt {}/{}): {err:#}",
+                    label,
+                    target_date.year(),
+                    target_date.month(),
+                    target_date.day(),
+                    slot.consecutive_failures,
+                    REMINDER_MAX_RETRIES
+                ));
+                maybe_notify_reminder_failure(slot, label, target_date);
+                return Err(err.context(format!(
+                    "failed to process catchup {} reminder for {}-{:02}-{:02}",
+                    label,
+                    target_date.year(),
+                    target_date.month(),
+                    target_date.day()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1768,8 +1915,13 @@ fn send_missing_daily_reminder(
     target_date: NaiveDate,
     label: &str,
 ) -> Result<()> {
+    if !is_linker_report_workday(target_date)? {
+        mark_report_confirmed(slot, now);
+        return Ok(());
+    }
     let snapshot = client.get_day_snapshot(target_date)?;
     if has_daily_report(&snapshot) {
+        mark_report_confirmed(slot, now);
         return Ok(());
     }
     let body = format!(
@@ -1845,7 +1997,11 @@ fn run_tray_app(
                 TrayUserEvent::RefreshLogin => {
                     if !busy {
                         busy = true;
-                        launch_refresh_login_task(proxy.clone(), client.clone(), notifications.clone());
+                        launch_refresh_login_task(
+                            proxy.clone(),
+                            client.clone(),
+                            notifications.clone(),
+                        );
                     }
                 }
                 TrayUserEvent::EnableLaunchAtLogin => {
@@ -1924,8 +2080,7 @@ fn build_tray_menu() -> Result<TrayMenu> {
     let submit_item = MenuItem::with_id(MENU_ID_SUBMIT_TODAY, "提交今天日志", true, None);
     let check_item = MenuItem::with_id(MENU_ID_CHECK_MISSING, "检查本月缺报", true, None);
     let login_item = MenuItem::with_id(MENU_ID_REFRESH_LOGIN, "刷新登录会话", true, None);
-    let enable_login_item =
-        MenuItem::with_id(MENU_ID_ENABLE_LOGIN, "开启开机自动启动", true, None);
+    let enable_login_item = MenuItem::with_id(MENU_ID_ENABLE_LOGIN, "开启开机自动启动", true, None);
     let disable_login_item =
         MenuItem::with_id(MENU_ID_DISABLE_LOGIN, "关闭开机自动启动", true, None);
     let quit_item = MenuItem::with_id(MENU_ID_QUIT, "退出", true, None);
@@ -2170,14 +2325,12 @@ fn run_daemon(
     loop {
         let now = Local::now();
         let next_run = next_run_after(now, schedule_time)?;
-        let sleep_duration = (next_run - now)
-            .to_std()
-            .context("failed to compute sleep duration")?;
+        let sleep_duration = sleep_duration_until(now, next_run)?;
         eprintln!(
             "next run scheduled at {}",
             next_run.format("%Y-%m-%d %H:%M:%S")
         );
-        thread::sleep(StdDuration::from_secs(sleep_duration.as_secs()));
+        thread::sleep(sleep_duration);
 
         let target_date = Local::now().date_naive();
         match execute_submit(client, target_date, out_work) {
@@ -2405,6 +2558,18 @@ mod tests {
     }
 
     #[test]
+    fn preserves_subsecond_sleep_duration() {
+        let now = Local
+            .with_ymd_and_hms(2026, 4, 2, 17, 59, 59)
+            .single()
+            .unwrap();
+        let target = now + Duration::milliseconds(500);
+        let sleep = sleep_duration_until(now, target).unwrap();
+        assert!(sleep > StdDuration::ZERO);
+        assert!(sleep < StdDuration::from_secs(1));
+    }
+
+    #[test]
     fn loads_log_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("2026-04-02.md");
@@ -2459,10 +2624,53 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn matches_reminder_windows() {
-        assert!(is_between_hours(NaiveTime::from_hms_opt(8, 0, 0).unwrap(), 8, 10));
-        assert!(is_between_hours(NaiveTime::from_hms_opt(9, 59, 0).unwrap(), 8, 10));
-        assert!(!is_between_hours(NaiveTime::from_hms_opt(10, 0, 0).unwrap(), 8, 10));
-        assert!(is_between_hours(NaiveTime::from_hms_opt(18, 0, 0).unwrap(), 18, 20));
-        assert!(!is_between_hours(NaiveTime::from_hms_opt(20, 0, 0).unwrap(), 18, 20));
+        assert!(is_between_hours(
+            NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+            8,
+            10
+        ));
+        assert!(is_between_hours(
+            NaiveTime::from_hms_opt(9, 59, 0).unwrap(),
+            8,
+            10
+        ));
+        assert!(!is_between_hours(
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+            8,
+            10
+        ));
+        assert!(is_between_hours(
+            NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+            18,
+            20
+        ));
+        assert!(!is_between_hours(
+            NaiveTime::from_hms_opt(20, 0, 0).unwrap(),
+            18,
+            20
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confirmed_report_suppresses_rechecks() {
+        let now = Local
+            .with_ymd_and_hms(2026, 4, 2, 18, 0, 0)
+            .single()
+            .unwrap();
+        let mut slot = ReminderSlotState::default();
+        mark_report_confirmed(&mut slot, now);
+        assert!(slot.report_confirmed);
+        assert!(slot.catchup_processed);
+        assert_eq!(slot.consecutive_failures, 0);
+        assert!(!reminder_due(&slot, now + Duration::minutes(31)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reminders_skip_non_workdays() {
+        assert!(!is_linker_report_workday(NaiveDate::from_ymd_opt(2026, 4, 6).unwrap()).unwrap());
+        assert!(!is_linker_report_workday(NaiveDate::from_ymd_opt(2026, 4, 5).unwrap()).unwrap());
+        assert!(is_linker_report_workday(NaiveDate::from_ymd_opt(2026, 5, 9).unwrap()).unwrap());
     }
 }
