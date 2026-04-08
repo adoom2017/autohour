@@ -2,3 +2,4 @@
 target/
 .linker_session.cookies.json
 dist/
+.claude/

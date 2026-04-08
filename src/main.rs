@@ -21,7 +21,7 @@ use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 #[cfg(target_os = "macos")]
-use mac_notification_sys::{MainButton, Notification, set_application};
+use mac_notification_sys::{Notification, set_application};
 use regex::Regex;
 use reqwest::Method;
 use reqwest::blocking::{Client, ClientBuilder};
@@ -707,7 +707,6 @@ impl LinkerClient {
 
     fn check_missing_daily(&self, year: i32, month: u32) -> Result<MissingDailyResult> {
         validate_year_month(year, month)?;
-        self.ensure_session()?;
         let payload = json!({ "year": year, "month": month });
         let response = self.post_json_with_relogin(DAILY_REPORT_API_URL, &payload)?;
         let data = response.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -717,6 +716,7 @@ impl LinkerClient {
         let mut excluded_non_workdays = Vec::new();
         let mut missing_workdays = Vec::new();
         let today = Local::now().date_naive();
+        let holiday_calendar = china_holiday_calendar(year)?;
 
         for day in raw_nowrite_days.iter().copied() {
             let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
@@ -726,7 +726,16 @@ impl LinkerClient {
                 excluded_today.push(day);
                 continue;
             }
-            if !is_linker_report_workday(date)? {
+            let weekday = date.weekday();
+            let is_weekend = matches!(weekday, chrono::Weekday::Sat | chrono::Weekday::Sun);
+            let is_workday = if holiday_calendar.makeup_workdays.contains(&date) {
+                true
+            } else if holiday_calendar.holidays.contains(&date) {
+                false
+            } else {
+                !is_weekend
+            };
+            if !is_workday {
                 excluded_non_workdays.push(day);
                 continue;
             }
@@ -1526,7 +1535,7 @@ fn send_macos_notification(title: &str, body: &str) -> Result<()> {
     notification
         .title(title)
         .message(body)
-        .main_button(MainButton::SingleAction("显示"));
+        .asynchronous(true);
     notification
         .send()
         .map_err(|err| anyhow!("failed to send macOS notification: {err}"))?;
