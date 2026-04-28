@@ -61,6 +61,8 @@ const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) 
 #[cfg(target_os = "macos")]
 const MENU_ID_SUBMIT_TODAY: &str = "submit_today";
 #[cfg(target_os = "macos")]
+const MENU_ID_SUBMIT_YESTERDAY: &str = "submit_yesterday";
+#[cfg(target_os = "macos")]
 const MENU_ID_CHECK_MISSING: &str = "check_missing";
 #[cfg(target_os = "macos")]
 const MENU_ID_REFRESH_LOGIN: &str = "refresh_login";
@@ -70,6 +72,8 @@ const MENU_ID_ENABLE_LOGIN: &str = "enable_login_item";
 const MENU_ID_DISABLE_LOGIN: &str = "disable_login_item";
 #[cfg(target_os = "macos")]
 const MENU_ID_QUIT: &str = "quit";
+#[cfg(target_os = "macos")]
+const MENU_ID_SUBMIT_PICK_DATE: &str = "submit_pick_date";
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "cc.linker.autohour";
 #[cfg(target_os = "macos")]
@@ -219,12 +223,15 @@ struct EmailConfig {
 #[cfg(target_os = "macos")]
 enum TrayUserEvent {
     SubmitToday,
+    SubmitYesterday,
+    SubmitPickDate,
+    SubmitDate(NaiveDate),
     CheckCurrentMonth,
     RefreshLogin,
     EnableLaunchAtLogin,
     DisableLaunchAtLogin,
     Quit,
-    TaskStarted(&'static str),
+    TaskStarted(String),
     TaskFinished(TaskOutcome),
 }
 
@@ -257,6 +264,8 @@ enum NotificationWork {
 struct TrayMenu {
     _tray: tray_icon::TrayIcon,
     submit_item: MenuItem,
+    submit_yesterday_item: MenuItem,
+    submit_pick_date_item: MenuItem,
     check_item: MenuItem,
     login_item: MenuItem,
     enable_login_item: MenuItem,
@@ -1529,6 +1538,34 @@ fn send_notifications(
 }
 
 #[cfg(target_os = "macos")]
+fn prompt_date_via_osascript(default: NaiveDate) -> Result<Option<NaiveDate>> {
+    let script = format!(
+        r#"display dialog "请输入日期（YYYY-MM-DD）" default answer "{}" with title "Autohour""#,
+        default.format("%Y-%m-%d")
+    );
+    let output = ProcessCommand::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .context("failed to launch osascript")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("(-128)") {
+            return Ok(None);
+        }
+        return Err(anyhow!("osascript error: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = stdout
+        .split("text returned:")
+        .nth(1)
+        .map(|s| s.trim())
+        .unwrap_or("")
+        .to_string();
+    let date = parse_target_date(&text)?;
+    Ok(Some(date))
+}
+
+#[cfg(target_os = "macos")]
 fn send_macos_notification(title: &str, body: &str) -> Result<()> {
     let _ = set_application("cc.linker.autohour");
     let mut notification = Notification::new();
@@ -1985,11 +2022,57 @@ fn run_tray_app(
                 TrayUserEvent::SubmitToday => {
                     if !busy {
                         busy = true;
-                        launch_submit_today_task(
+                        launch_submit_task(
                             proxy.clone(),
                             client.clone(),
                             notifications.clone(),
                             default_out_work.clone(),
+                            Local::now().date_naive(),
+                            "今天".to_string(),
+                        );
+                    }
+                }
+                TrayUserEvent::SubmitYesterday => {
+                    if !busy {
+                        busy = true;
+                        launch_submit_task(
+                            proxy.clone(),
+                            client.clone(),
+                            notifications.clone(),
+                            default_out_work.clone(),
+                            Local::now().date_naive() - Duration::days(1),
+                            "昨日".to_string(),
+                        );
+                    }
+                }
+                TrayUserEvent::SubmitPickDate => {
+                    if !busy {
+                        let proxy2 = proxy.clone();
+                        let today = Local::now().date_naive();
+                        thread::spawn(move || {
+                            match prompt_date_via_osascript(today) {
+                                Ok(Some(date)) => {
+                                    let _ = proxy2.send_event(TrayUserEvent::SubmitDate(date));
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    eprintln!("date prompt error: {err}");
+                                }
+                            }
+                        });
+                    }
+                }
+                TrayUserEvent::SubmitDate(date) => {
+                    if !busy {
+                        busy = true;
+                        let label = date.format("%Y-%m-%d").to_string();
+                        launch_submit_task(
+                            proxy.clone(),
+                            client.clone(),
+                            notifications.clone(),
+                            default_out_work.clone(),
+                            date,
+                            label,
                         );
                     }
                 }
@@ -2030,7 +2113,7 @@ fn run_tray_app(
                 }
                 TrayUserEvent::TaskStarted(status) => {
                     if let Some(menu) = tray_menu.as_ref() {
-                        set_tray_busy_state(menu, true, status);
+                        set_tray_busy_state(menu, true, &status);
                     }
                 }
                 TrayUserEvent::TaskFinished(outcome) => {
@@ -2087,6 +2170,10 @@ fn run_tray_app(
 fn build_tray_menu() -> Result<TrayMenu> {
     let status_item = MenuItem::new("状态：监控中", false, None);
     let submit_item = MenuItem::with_id(MENU_ID_SUBMIT_TODAY, "提交今天日志", true, None);
+    let submit_yesterday_item =
+        MenuItem::with_id(MENU_ID_SUBMIT_YESTERDAY, "提交昨日日志", true, None);
+    let submit_pick_date_item =
+        MenuItem::with_id(MENU_ID_SUBMIT_PICK_DATE, "提交指定日期…", true, None);
     let check_item = MenuItem::with_id(MENU_ID_CHECK_MISSING, "检查本月缺报", true, None);
     let login_item = MenuItem::with_id(MENU_ID_REFRESH_LOGIN, "刷新登录会话", true, None);
     let enable_login_item = MenuItem::with_id(MENU_ID_ENABLE_LOGIN, "开启开机自动启动", true, None);
@@ -2100,6 +2187,8 @@ fn build_tray_menu() -> Result<TrayMenu> {
     menu.append(&status_item)?;
     menu.append(&separator_top)?;
     menu.append(&submit_item)?;
+    menu.append(&submit_yesterday_item)?;
+    menu.append(&submit_pick_date_item)?;
     menu.append(&check_item)?;
     menu.append(&login_item)?;
     menu.append(&separator_middle)?;
@@ -2119,6 +2208,8 @@ fn build_tray_menu() -> Result<TrayMenu> {
     Ok(TrayMenu {
         _tray: tray,
         submit_item,
+        submit_yesterday_item,
+        submit_pick_date_item,
         check_item,
         login_item,
         enable_login_item,
@@ -2133,18 +2224,22 @@ fn map_menu_event(event: MenuEvent) -> TrayUserEvent {
     let id = event.id.0.as_ref();
     match id {
         MENU_ID_SUBMIT_TODAY => TrayUserEvent::SubmitToday,
+        MENU_ID_SUBMIT_YESTERDAY => TrayUserEvent::SubmitYesterday,
+        MENU_ID_SUBMIT_PICK_DATE => TrayUserEvent::SubmitPickDate,
         MENU_ID_CHECK_MISSING => TrayUserEvent::CheckCurrentMonth,
         MENU_ID_REFRESH_LOGIN => TrayUserEvent::RefreshLogin,
         MENU_ID_ENABLE_LOGIN => TrayUserEvent::EnableLaunchAtLogin,
         MENU_ID_DISABLE_LOGIN => TrayUserEvent::DisableLaunchAtLogin,
         MENU_ID_QUIT => TrayUserEvent::Quit,
-        _ => TrayUserEvent::TaskStarted("状态：就绪"),
+        _ => TrayUserEvent::TaskStarted("状态：就绪".to_string()),
     }
 }
 
 #[cfg(target_os = "macos")]
 fn set_tray_busy_state(menu: &TrayMenu, busy: bool, status: &str) {
     menu.submit_item.set_enabled(!busy);
+    menu.submit_yesterday_item.set_enabled(!busy);
+    menu.submit_pick_date_item.set_enabled(!busy);
     menu.check_item.set_enabled(!busy);
     menu.login_item.set_enabled(!busy);
     let installed = launch_agent_installed();
@@ -2178,26 +2273,28 @@ fn build_tray_icon() -> Result<tray_icon::Icon> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_submit_today_task(
+fn launch_submit_task(
     proxy: EventLoopProxy<TrayUserEvent>,
     client: LinkerClient,
     notifications: NotificationConfig,
     out_work: String,
+    target_date: NaiveDate,
+    date_label: String,
 ) {
     thread::spawn(move || {
-        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在提交今天日志"));
-        let target_date = Local::now().date_naive();
+        let status = format!("状态：正在提交 {date_label} 日志");
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted(status));
         let outcome = match execute_submit(&client, target_date, &out_work) {
             Ok(result) => TaskOutcome::Success {
                 title: "autohour 提交成功".to_string(),
                 body: summarize_result(&result),
-                status: "状态：最近一次提交成功".to_string(),
+                status: format!("状态：{date_label}日志提交成功"),
                 notify_remote: true,
             },
             Err(err) => TaskOutcome::Failure {
                 title: "autohour 提交失败".to_string(),
                 body: format!("日期: {target_date}\n错误: {err}"),
-                status: "状态：最近一次提交失败".to_string(),
+                status: format!("状态：{date_label}日志提交失败"),
                 notify_remote: true,
             },
         };
@@ -2213,7 +2310,7 @@ fn launch_check_missing_task(
     notifications: NotificationConfig,
 ) {
     thread::spawn(move || {
-        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在检查缺报"));
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在检查缺报".to_string()));
         let outcome = match execute_check_missing(&client, None, None) {
             Ok(result) => {
                 let has_missing = !result.missing_workdays.is_empty();
@@ -2252,7 +2349,7 @@ fn launch_refresh_login_task(
     notifications: NotificationConfig,
 ) {
     thread::spawn(move || {
-        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在刷新登录会话"));
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在刷新登录会话".to_string()));
         let outcome = match client.relogin() {
             Ok((cookie_name, _cookie_value)) => TaskOutcome::Success {
                 title: "autohour 登录成功".to_string(),
@@ -2275,7 +2372,7 @@ fn launch_refresh_login_task(
 #[cfg(target_os = "macos")]
 fn launch_install_launch_agent_task(proxy: EventLoopProxy<TrayUserEvent>) {
     thread::spawn(move || {
-        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在开启开机启动"));
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在开启开机启动".to_string()));
         let outcome = match install_launch_agent() {
             Ok(path) => TaskOutcome::Success {
                 title: "autohour 已开启开机启动".to_string(),
@@ -2297,7 +2394,7 @@ fn launch_install_launch_agent_task(proxy: EventLoopProxy<TrayUserEvent>) {
 #[cfg(target_os = "macos")]
 fn launch_uninstall_launch_agent_task(proxy: EventLoopProxy<TrayUserEvent>) {
     thread::spawn(move || {
-        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在关闭开机启动"));
+        let _ = proxy.send_event(TrayUserEvent::TaskStarted("状态：正在关闭开机启动".to_string()));
         let outcome = match uninstall_launch_agent() {
             Ok(path) => TaskOutcome::Success {
                 title: "autohour 已关闭开机启动".to_string(),
