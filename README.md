@@ -127,6 +127,32 @@ dist/Autohour.app
 dist/Autohour.app.zip
 ```
 
+### 代码签名与公证
+
+构建脚本支持自动签名和 Apple 公证，签名后用户下载不会再出现「已损坏，无法打开」的 Gatekeeper 提示。
+
+设置以下环境变量后再执行构建脚本即可：
+
+```bash
+# 签名证书名称（不设置则自动检测 Keychain 中的 Developer ID Application 证书）
+export CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)'
+
+# Apple 公证所需凭据
+export APPLE_ID='you@example.com'
+export APPLE_TEAM_ID='XXXXXXXXXX'
+export APPLE_APP_PASSWORD='xxxx-xxxx-xxxx-xxxx'  # App 专用密码
+
+./scripts/build-macos-app.sh
+```
+
+如果不配置签名相关变量，构建脚本会跳过签名和公证步骤（行为与之前一致）。
+
+也可以设置 `SKIP_SIGNING=1` 显式跳过签名：
+
+```bash
+SKIP_SIGNING=1 ./scripts/build-macos-app.sh
+```
+
 生成占位应用图标：
 
 ```bash
